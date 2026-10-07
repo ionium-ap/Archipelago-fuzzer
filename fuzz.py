@@ -417,7 +417,7 @@ def generate_random_yaml(world_name, meta):
         apply_constraints(game_options, fuzz_constraints, option_defs)
 
     yaml_content = {
-        "description": f"{game_name} Template, generated with https://github.com/Eijebong/Archipelago-fuzzer/tree/{__version__}",
+        "description": f"{game_name} Template, generated with https://github.com/ionium-ap/Archipelago-fuzzer/tree/{__version__}",
         "game": game_name,
         "requires": {
             "version": __ap_version__,
@@ -732,13 +732,17 @@ def dump_generation_output(outcome, apworld_name, i, yamls_dir, out_buf, extra=N
         error_ty = "error"
 
     error_output_dir = os.path.join(OUT_DIR, error_ty, apworld_name, str(i))
-    os.makedirs(error_output_dir)
+    # The main process can end up here for a run its worker already dumped, for example when
+    # the worker's result fails to pickle and the pool reports that through `error` instead.
+    # Raising on the existing directory would skip `gen_callback` and leak that run's slot in
+    # SUBMITTED forever, so tolerate it and append to the worker's log rather than replace it.
+    os.makedirs(error_output_dir, exist_ok=True)
 
     for yaml_file in os.listdir(yamls_dir):
         shutil.copy(os.path.join(yamls_dir, yaml_file), error_output_dir)
 
     error_log_path = os.path.join(error_output_dir, f"{i}.log")
-    with open(error_log_path, "w", encoding='utf-8') as fd:
+    with open(error_log_path, "a", encoding='utf-8') as fd:
         fd.write(out_buf.getvalue())
         if extra is not None:
             fd.write(extra)
