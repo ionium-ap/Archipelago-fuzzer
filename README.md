@@ -38,6 +38,42 @@ The output will be available in `./fuzz_output`.
   Composes with `--with-static-worlds`.
 - `--hook` takes a `module:class` string to a hook and can be specified multiple times. More information about that below
 
+## Output
+
+Every generation that didn't succeed gets a directory in `./fuzz_output`
+containing its YAMLs and a log of the generation:
+
+- `error/<apworld>/<run>/` for failures
+- `timeout/<apworld>/<run>/` for generations that went over `-t`
+- `ignored/<apworld>/<run>/` for option errors, only with `--dump-ignored`
+
+`fuzz_output/report.json` summarizes the whole run:
+
+```json
+{
+  "stats": {"total": 100, "success": 96, "failure": 3, "timeout": 1, "ignored": 0},
+  "errors": {
+    "alttp": {
+      "FillError": [12, 57],
+      "Some exception message": [80],
+      "TimeoutError": [33]
+    }
+  }
+}
+```
+
+`errors` lists the runs of each apworld by what went wrong with them:
+
+- `FillError` for every fill error, whatever its message is
+- the message of the exception for any other failure
+- the name of the exception class if the exception has no message, which is
+  also how timeouts end up under `TimeoutError`
+- `No exception, outcome set by hook <module>:<class>` when a hook failed the
+  generation without giving an exception
+
+The fuzzer exits with 0 if there was no failure and no timeout, 1 if there was
+at least one, and 2 if the fuzzer itself crashed.
+
 ## Meta files
 
 You can force some options to always be the same value by providing a meta file via the `-m` flag.
@@ -215,6 +251,12 @@ class Hook(BaseHook):
         The one exception is for timeouts where the outcome has to be processed on the main process.
         As such, this function must do very minimal work and not make
         assumptions as whether it's running in worker or in the main process.
+
+        If you turn an outcome into a `GenOutcome.Failure`, return an exception
+        along with it. Its message is what the failure is reported under in
+        `report.json` (see "Output" above), so keep it short and identical for
+        every generation that fails for the same reason, and print the details
+        of that one generation instead, they end up in its log.
         """
         return GenOutcome.Success, exception
 

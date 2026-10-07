@@ -41,7 +41,6 @@ try:
 except ImportError:
     class PlayerFilesError(Exception):
         pass
-from Fill import FillError
 from Main import main as ERmain
 from settings import get_settings
 from argparse import Namespace, ArgumentParser
@@ -697,8 +696,7 @@ def gen_wrapper(yaml_path, apworld_name, i, args, queue, tmp):
                     else:
                         outcome = GenOutcome.Failure
 
-                for hook in MP_HOOKS:
-                    outcome, raised = hook.reclassify_outcome(outcome, raised)
+                outcome, raised, culprit = reclassify_with_hooks(MP_HOOKS, outcome, raised)
 
                 if outcome == GenOutcome.Success:
                     return outcome
@@ -706,18 +704,61 @@ def gen_wrapper(yaml_path, apworld_name, i, args, queue, tmp):
                 if outcome == GenOutcome.OptionError and not args.dump_ignored:
                     return outcome
 
+                exc_type, exc_str = describe_failure(raised, culprit)
+
                 if outcome == GenOutcome.Timeout:
                     extra = f"[...] Generation killed here after {args.timeout}s"
                 elif isinstance(raised, PlayerFilesError):
                     extra = str(raised)
+                elif raised is None:
+                    extra = exc_str
                 else:
                     extra = "".join(traceback.format_exception(raised))
 
+                # The live exception must not be what we return. The pool pickles the result in
+                # this process, and the exception's traceback keeps every frame of the generation,
+                # and so the whole multiworld, alive while it does. A worker that is short on
+                # memory then dies inside the pool's own error handling, where nothing can catch
+                # it, and its run is never reported back. The main process only needs the name and
+                # the message anyway, so send those and let go of the rest first. A multiworld is
+                # full of reference cycles, dropping our references isn't enough to free it.
+                raised = mw = None
+                gc.collect()
+
                 dump_generation_output(outcome, apworld_name, i, yaml_path, out_buf, extra)
 
-                return outcome, raised
+                return outcome, exc_type, exc_str
     except Exception as e:
         raise FuzzerException("Fuzzer error", out_buf) from e
+
+
+def reclassify_with_hooks(hooks, outcome, raised):
+    """
+    Runs an outcome through `reclassify_outcome` of every hook. Also returns the last hook that
+    changed anything, which is the one to name when a failure ends up without an exception.
+    """
+    culprit = None
+    for hook in hooks:
+        new_outcome, new_raised = hook.reclassify_outcome(outcome, raised)
+        if new_outcome != outcome or new_raised is not raised:
+            culprit = hook
+        outcome, raised = new_outcome, new_raised
+
+    return outcome, raised, culprit
+
+
+def describe_failure(raised, culprit=None):
+    """
+    Returns the name of the exception type and the message that a failure gets reported under.
+    Those two strings are all that ever leaves a worker, see the end of `gen_wrapper`.
+    """
+    if raised is None and culprit is not None:
+        # A hook can fail a generation that didn't raise anything. There's nothing to describe
+        # then, so at least say which hook it was instead of reporting it as "None".
+        hook_path = f"{type(culprit).__module__}:{type(culprit).__qualname__}"
+        return hook_path, f"No exception, outcome set by hook {hook_path}"
+
+    return type(raised).__name__, str(raised)
 
 
 def dump_generation_output(outcome, apworld_name, i, yamls_dir, out_buf, extra=None):
@@ -767,9 +808,9 @@ REPORT = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: [])))
 def gen_callback(yamls_dir, apworld_name, i, args, outcome):
     try:
         if isinstance(outcome, tuple):
-            outcome, exc = outcome
+            outcome, exc_type, exc_str = outcome
         else:
-            exc = None
+            exc_type, exc_str = None, None
 
         global SUCCESS, FAILURE, SUBMITTED, OPTION_ERRORS, TIMEOUTS
         SUBMITTED -= 1
@@ -779,12 +820,12 @@ def gen_callback(yamls_dir, apworld_name, i, args, outcome):
             if IS_TTY:
                 print(".", end="")
         elif outcome == GenOutcome.Failure:
-            REPORT[apworld_name][type(exc)][str(exc)].append(i)
+            REPORT[apworld_name][exc_type][exc_str].append(i)
             FAILURE += 1
             if IS_TTY:
                 print("F", end="")
         elif outcome == GenOutcome.Timeout:
-            REPORT[apworld_name][TimeoutError][""].append(i)
+            REPORT[apworld_name]["TimeoutError"][""].append(i)
             TIMEOUTS += 1
             if IS_TTY:
                 print("T", end="")
@@ -821,7 +862,7 @@ def error(yamls_dir, apworld_name, i, args, raised):
         msg.write("\n".join(traceback.format_exception(raised)))
 
         dump_generation_output(GenOutcome.Failure, apworld_name, i, yamls_dir, msg)
-        return gen_callback(yamls_dir, apworld_name, i, args, GenOutcome.Failure)
+        return gen_callback(yamls_dir, apworld_name, i, args, (GenOutcome.Failure, *describe_failure(raised)))
     except Exception as e:
         print("Error while handling fuzzing result:")
         traceback.print_exception(e)
@@ -872,6 +913,9 @@ class BaseHook:
         You can reclassify the outcome with this before it is returned to the main process by returning a new `GenOutcome`
         Note that because timeouts are processed by the main process and not by the worker itself (as it is busy timing out),
         this function can be called from both the main process and the workers.
+        A failure is reported under the message of the exception returned here. Without one, all the report can say is
+        which hook failed the generation, so return an exception with a short message that is the same for every
+        generation failing for the same reason.
         """
         return outcome, raised
 
@@ -893,7 +937,7 @@ def write_report(report):
 
         for exc_type, exc_report in game_report.items():
             for exc_str, yamls in exc_report.items():
-                if exc_type == FillError:
+                if exc_type == "FillError":
                     errors[game_name]["FillError"].extend(yamls)
                 else:
                     if exc_str:
@@ -1021,10 +1065,9 @@ if __name__ == "__main__":
 
                     extra = f"[...] Generation killed here after {args.timeout}s"
                     outcome = GenOutcome.Timeout
-                    for hook in MAIN_HOOKS:
-                        outcome, _ = hook.reclassify_outcome(outcome, TimeoutError())
+                    outcome, raised, culprit = reclassify_with_hooks(MAIN_HOOKS, outcome, TimeoutError())
                     dump_generation_output(outcome, apworld_name, i, yamls_dir, out_buf, extra)
-                    gen_callback(yamls_dir, apworld_name, i, args, outcome)
+                    gen_callback(yamls_dir, apworld_name, i, args, (outcome, *describe_failure(raised, culprit)))
                 except KeyboardInterrupt:
                     break
                 except EOFError:
