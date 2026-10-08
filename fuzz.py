@@ -1200,6 +1200,8 @@ if __name__ == "__main__":
                         help="Directory of YAML files to sample from instead of generating random YAMLs. Each generation picks N (see -n) random files from the directory. Incompatible with -g and -m")
     parser.add_argument("--hook", action="append", default=[])
     parser.add_argument("--skip-output", default=False, action="store_true")
+    parser.add_argument("--max-tasks-per-child", default=100, type=int,
+                        help="Replace a worker process with a fresh one after that many generations. 0 keeps workers for the whole run.")
     parser.add_argument("--stall-timeout", default=None, type=int,
                         help="Give up when no generation finished for that many seconds, and report what did finish. Defaults to twice the timeout plus 5 minutes, 0 disables it.")
 
@@ -1224,7 +1226,16 @@ if __name__ == "__main__":
         start_method = "fork" if can_fork else "spawn"
         multiprocessing.set_start_method(start_method)
         tmp = tempfile.TemporaryDirectory(prefix="apfuzz")
-        with Pool(processes=args.jobs, maxtasksperchild=None) as p:
+        # Workers have to be replaced once in a while. Whatever memory a generation leaves behind
+        # in its worker stays there for every generation that worker runs afterwards. That's
+        # only bloat most of the time, but when the fuzzer runs with a memory limit, a worker
+        # that got close to it once can't generate anything anymore and fails everything it's
+        # given with a MemoryError, usually as early as when reading the player files. The
+        # number of failures then says when that happened and not how often the world fails.
+        # A worker fails at most `maxtasksperchild - 1` generations that way before it's replaced.
+        # Tuning the allocator could give some of that memory back, a new process gives back all
+        # of it, and it's cheap since we fork: a new worker doesn't have to load the worlds again.
+        with Pool(processes=args.jobs, maxtasksperchild=args.max_tasks_per_child or None) as p:
             START = time.perf_counter()
             main(p, args, tmp.name)
     except KeyboardInterrupt:

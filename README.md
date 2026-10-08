@@ -28,6 +28,9 @@ The output will be available in `./fuzz_output`.
   Defaults to 1. You can also specify ranges like `1-10` to make all
   generations pick a number between 1 and 10 YAMLs.
 - `-t` specifies the maximum time per generation in seconds. Defaults to 15s.
+- `--max-tasks-per-child` specifies after how many generations a worker process
+  is replaced with a fresh one. Defaults to 100, `0` keeps the same workers for
+  the whole run. See "Memory limits" below.
 - `--stall-timeout` specifies after how many seconds without any generation
   finishing the fuzzer gives up and reports what it has. Defaults to twice the
   value of `-t` plus 5 minutes, `0` disables it. It is disabled by default when
@@ -99,14 +102,37 @@ write its report for the generations that finished before exiting. If you run
 the fuzzer from a script that has its own time limit, interrupt it instead of
 killing it, or its results are lost.
 
+### Memory limits
+
 If you want generations that use too much memory to show up as failures
 instead of being lost, limit the memory of the fuzzer. Its workers inherit the
 limit and a generation going over it fails with a `MemoryError`, which is
 reported like any other failure:
 
 ```
-( ulimit -v 1572864; python fuzz.py -r 100 -j 4 -g alttp )
+( ulimit -v 1572864; python fuzz.py -r 100 -j 4 -g alttp --max-tasks-per-child 1 )
 ```
+
+A worker doesn't get its memory back after a generation like that. It stays
+close to the limit and fails every generation it runs afterwards, until it is
+replaced. You can usually tell those failures from real ones by where they
+happen: the `MemoryError` is raised while reading the player files, before the
+generation even started (`Errors in player files` followed by `MemoryError` in
+the report). In a long run they all come after a given point instead of being
+spread out.
+
+`--max-tasks-per-child` bounds how many of those you get: a worker can fail up
+to that number minus one generations for each generation that really ran out of
+memory. With the default of 100, a few of them are enough to make the failure
+count meaningless, so use `--max-tasks-per-child 1` whenever you set a limit.
+Every generation then gets a brand new worker and the failures are exactly the
+generations that ran out of memory.
+
+Replacing a worker isn't free: it costs around 50 to 100ms each time, and
+`setup_worker` of every hook runs again in the new worker. That is nothing
+every 100 generations, and a few percent for a world taking seconds to
+generate when it happens for every generation. It makes a world that generates
+in milliseconds several times slower to fuzz.
 
 ## Meta files
 
