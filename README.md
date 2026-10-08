@@ -28,6 +28,10 @@ The output will be available in `./fuzz_output`.
   Defaults to 1. You can also specify ranges like `1-10` to make all
   generations pick a number between 1 and 10 YAMLs.
 - `-t` specifies the maximum time per generation in seconds. Defaults to 15s.
+- `--stall-timeout` specifies after how many seconds without any generation
+  finishing the fuzzer gives up and reports what it has. Defaults to twice the
+  value of `-t` plus 5 minutes, `0` disables it. It is disabled by default when
+  `-t` is `0`. See "Lost generations" below.
 - `-m` to specify a meta file that overrides specific values
 - `--skip-output` specifies to skip the output step of generation.
 - `--dump-ignored` makes it so option errors are also dumped in the result.
@@ -51,7 +55,7 @@ containing its YAMLs and a log of the generation:
 
 ```json
 {
-  "stats": {"total": 100, "success": 96, "failure": 3, "timeout": 1, "ignored": 0},
+  "stats": {"total": 100, "success": 96, "failure": 3, "timeout": 1, "ignored": 0, "unfinished": 0},
   "errors": {
     "alttp": {
       "FillError": [12, 57],
@@ -71,8 +75,38 @@ containing its YAMLs and a log of the generation:
 - `No exception, outcome set by hook <module>:<class>` when a hook failed the
   generation without giving an exception
 
-The fuzzer exits with 0 if there was no failure and no timeout, 1 if there was
-at least one, and 2 if the fuzzer itself crashed.
+`unfinished` counts the generations that were started but never reported back.
+They are not part of `total`.
+
+The fuzzer exits with:
+
+- `0` if there was no failure and no timeout
+- `1` if there was at least one
+- `2` if the fuzzer itself crashed, in which case there is no report
+- `3` if it gave up waiting for generations that never reported back
+
+### Lost generations
+
+A worker process that dies in the middle of a generation never reports it back.
+The usual cause is a generation that needs so much memory that the system kills
+the worker. The fuzzer can't tell that this happened, it only sees that some
+generations are still pending. Once nothing has finished for `--stall-timeout`
+seconds, it stops waiting for them, says so, and writes its report with
+everything that did finish.
+
+You can also interrupt the fuzzer at any time (`Ctrl+C` or `SIGINT`), it will
+write its report for the generations that finished before exiting. If you run
+the fuzzer from a script that has its own time limit, interrupt it instead of
+killing it, or its results are lost.
+
+If you want generations that use too much memory to show up as failures
+instead of being lost, limit the memory of the fuzzer. Its workers inherit the
+limit and a generation going over it fails with a `MemoryError`, which is
+reported like any other failure:
+
+```
+( ulimit -v 1572864; python fuzz.py -r 100 -j 4 -g alttp )
+```
 
 ## Meta files
 

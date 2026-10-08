@@ -802,7 +802,9 @@ FAILURE = 0
 TIMEOUTS = 0
 OPTION_ERRORS = 0
 SUBMITTED = 0
-REPORT = defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: [])))
+# When a run was last submitted or last reported back, see `check_for_stall`
+LAST_PROGRESS = time.monotonic()
+REPORT =defaultdict(lambda: defaultdict(lambda: defaultdict(lambda: [])))
 
 
 def gen_callback(yamls_dir, apworld_name, i, args, outcome):
@@ -812,8 +814,9 @@ def gen_callback(yamls_dir, apworld_name, i, args, outcome):
         else:
             exc_type, exc_str = None, None
 
-        global SUCCESS, FAILURE, SUBMITTED, OPTION_ERRORS, TIMEOUTS
+        global SUCCESS, FAILURE, SUBMITTED, OPTION_ERRORS, TIMEOUTS, LAST_PROGRESS
         SUBMITTED -= 1
+        LAST_PROGRESS = time.monotonic()
 
         if outcome == GenOutcome.Success:
             SUCCESS += 1
@@ -869,12 +872,38 @@ def error(yamls_dir, apworld_name, i, args, raised):
         print("This is most likely a fuzzer bug and should be reported")
 
 
+class StalledError(Exception):
+    pass
+
+
+def check_for_stall(args):
+    """
+    Raises a `StalledError` when no run was submitted or reported back for `--stall-timeout`
+    seconds. This is meant to be called while waiting for runs to come back.
+
+    A worker that dies takes its run with it. The pool starts a new worker but never gives it
+    that run, and neither `gen_callback` nor `error` is ever called for it, so SUBMITTED never
+    goes back down. Whatever killed the worker (the OOM killer, a crash in a C extension, running
+    out of memory while sending its result...), the main process would wait for that run forever.
+    Being killed from the outside at that point means losing the report of every run that did
+    come back, so we give up by ourselves instead.
+
+    `concurrent.futures.ProcessPoolExecutor` would tell us right away that a worker died, but it
+    does so by failing every pending run and not only the one that was lost, and using it means
+    rewriting how runs are submitted and reported. This is cruder, it does cover every cause.
+    """
+    if args.stall_timeout > 0 and time.monotonic() - LAST_PROGRESS > args.stall_timeout:
+        raise StalledError()
+
+
 def print_status():
     print()
     print("Success:", SUCCESS)
     print("Failures:", FAILURE)
     print("Timeouts:", TIMEOUTS)
     print("Ignored:", OPTION_ERRORS)
+    if SUBMITTED > 0:
+        print("Unfinished:", SUBMITTED)
     print()
     print("Time taken: {:.2f}s".format(time.perf_counter() - START))
 
@@ -951,6 +980,9 @@ def write_report(report):
         "failure": FAILURE,
         "timeout": TIMEOUTS,
         "ignored": OPTION_ERRORS,
+        # Runs that were submitted but never reported back, because the fuzzer was interrupted
+        # or because it stalled. They're not part of the total.
+        "unfinished": SUBMITTED,
     }
 
     computed_report = {"stats": stats, "errors": errors}
@@ -963,7 +995,7 @@ if __name__ == "__main__":
     MAIN_HOOKS = []
 
     def main(p, args, tmp):
-        global SUBMITTED
+        global SUBMITTED, LAST_PROGRESS
 
         if args.sample_from:
             if args.game:
@@ -1121,6 +1153,7 @@ if __name__ == "__main__":
                 clear_abc_caches()
 
             SUBMITTED += 1
+            LAST_PROGRESS = time.monotonic()
 
             yamls_dir = tempfile.mkdtemp(prefix="apfuzz", dir=tmp)
             for name, yaml_content in yamls_to_write:
@@ -1138,15 +1171,19 @@ if __name__ == "__main__":
                 error_callback=functools.partial(error, yamls_dir, actual_apworld, i, args),
             )
 
+            # Runs that never report back keep their slot forever, so once enough of them are
+            # lost this is where a run gets stuck, long before the last run is submitted.
             while SUBMITTED >= args.jobs * 10:
                 # Poll the last job to keep the queue running
                 last_job.ready()
+                check_for_stall(args)
                 time.sleep(0.001)
 
             i += 1
 
         while SUBMITTED > 0:
             last_job.ready()
+            check_for_stall(args)
             time.sleep(0.05)
 
     parser = ArgumentParser(prog="apfuzz")
@@ -1163,14 +1200,23 @@ if __name__ == "__main__":
                         help="Directory of YAML files to sample from instead of generating random YAMLs. Each generation picks N (see -n) random files from the directory. Incompatible with -g and -m")
     parser.add_argument("--hook", action="append", default=[])
     parser.add_argument("--skip-output", default=False, action="store_true")
+    parser.add_argument("--stall-timeout", default=None, type=int,
+                        help="Give up when no generation finished for that many seconds, and report what did finish. Defaults to twice the timeout plus 5 minutes, 0 disables it.")
 
     args = parser.parse_args()
+
+    if args.stall_timeout is None:
+        # The slowest a healthy run can be is every worker running into the timeout at once, the
+        # rest is headroom for what the timeout doesn't cover, like workers starting up.
+        # Without a timeout a generation can take forever, there's no telling a stall from that.
+        args.stall_timeout = args.timeout * 2 + 300 if args.timeout > 0 else 0
 
     # This is just to make sure that the host.yaml file exists by the time we fork
     # so that a first run on a new installation doesn't throw out failures until
     # the host.yaml from the first gen is written
     get_settings()
     crashed = False
+    stalled = False
     try:
         can_fork = hasattr(os, "fork")
         # fork here is way faster because it doesn't have to reload all worlds, but it's only available on some platforms
@@ -1182,7 +1228,16 @@ if __name__ == "__main__":
             START = time.perf_counter()
             main(p, args, tmp.name)
     except KeyboardInterrupt:
+        # An interrupted fuzzer still reports the runs that finished, with its usual exit code.
+        # This is how anything supervising the fuzzer can stop it and keep its results, so this
+        # must not turn into a crash.
         pass
+    except StalledError:
+        stalled = True
+        print()
+        print(f"Stalled: nothing finished in the last {args.stall_timeout}s but {SUBMITTED} run(s) never reported back.")
+        print("Their workers most likely died, for example because they ran out of memory.")
+        print("Giving up on them, the results below are only about the runs that did report back.")
     except Exception as e:
         crashed = True
         traceback.print_exc()
@@ -1198,6 +1253,11 @@ if __name__ == "__main__":
         if not crashed:
             print_status()
             write_report(REPORT)
+            # os._exit doesn't flush anything. When stdout isn't a TTY, what we just printed
+            # would never make it out without this.
+            sys.stdout.flush()
+            if stalled:
+                os._exit(3)
             os._exit((FAILURE + TIMEOUTS) != 0)
 
         os._exit(2)
